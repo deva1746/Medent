@@ -122,9 +122,8 @@ import getpass
 import json
 import logging
 import os
-import shutil
 import time
-import xml.etree.ElementTree as ET
+import zipfile
 from ctypes import byref
 from datetime import datetime
 from pathlib import Path
@@ -133,8 +132,6 @@ import comtypes
 import numpy as np
 import comtypes.client
 import keyring
-import pythoncom
-import win32com.client
 import win32con
 import win32gui
 import win32process
@@ -1911,7 +1908,7 @@ def _capture_diagnostics(label, win, menu_hwnds=None, menu_items=None, menu_erro
         audit("msaa_menu_dumped", path=str(msaa_path), label=label)
 
 
-def navigate_to_point_ar_report(app, output_path):
+def navigate_to_point_ar_report(app):
     """Click Reports, broaden hwnd/signal detection for the WP Menu Class
     flyout, identify the 'Open Item Reports' item via MSAA, verify it has a
     usable position, and expand its submenu (see _expand_submenu_item) via a
@@ -1921,9 +1918,10 @@ def navigate_to_point_ar_report(app, output_path):
     richest evidence gathered so far when something doesn't match what's
     been confirmed live -- see the module docstring.
 
-    `output_path` is where the real report data (an XML Spreadsheet, read
-    out of Excel via COM -- see below) ends up; a sibling '.pdf' is also
-    written from the native Print dialog along the way.
+    Returns the path of the real report data, saved as a genuine .xlsx file
+    via Excel's own File -> Save As (see save_excel_as_xlsx) into
+    PDF_OUTPUT_DIR; a sibling '.pdf' is also written from the native Print
+    dialog along the way.
     """
     win = app.top_window()
     main_hwnd = win.handle  # captured before the click, see _enumerate_menu_candidate_hwnds
@@ -3283,42 +3281,28 @@ def navigate_to_point_ar_report(app, output_path):
         )
     audit("excel_opened")
 
-    # Rather than UI-automate Excel's own File -> Save As -> Browse ->
-    # change format to "Excel Workbook" -> Save (what the live walkthrough
-    # did by hand -- the single riskiest, least-tested remaining part of
-    # this whole flow: backstage menus, a format dropdown, and a
-    # compatibility prompt that appeared in ONE of the two live runs but
-    # not the other, depending on exactly when the format was changed),
-    # read the real data out directly via Excel's own COM API instead.
-    # Excel always registers itself in the Running Object Table, so this
-    # needs no window-clicking at all: get the live Application object,
-    # copy its ActiveWorkbook's real file off disk to OUTPUT_DIR exactly as
-    # Medent generated it (already confirmed well-formed XML, same format
-    # verify_exported_report() already checks), then close the workbook
-    # without resaving -- the original temp file is left untouched, and
-    # nothing here can hit an unexpected Excel dialog.
-    pythoncom.CoInitialize()
-    try:
-        excel_app = win32com.client.GetActiveObject("Excel.Application")
-        workbook = excel_app.ActiveWorkbook
-        if workbook is None:
-            raise RuntimeError("Excel is open but has no ActiveWorkbook")
-        source_path = Path(workbook.FullName)
-        shutil.copy(source_path, output_path)
-        audit("copied_report_data", source=str(source_path), dest=str(output_path))
-        workbook.Close(SaveChanges=False)
-    except Exception as exc:
-        _capture_diagnostics("excel_com_copy_failed", win)
-        raise NavigationCheckpoint(
-            f"Excel opened, but reading its ActiveWorkbook via COM failed: "
-            f"{exc!r}. Inspect diagnostics under OUTPUT_DIR -- the report "
-            "data may still be sitting open in Excel; check it directly "
-            "before closing anything by hand."
-        )
+    # Report data is saved via Excel's own File -> Save As, converting
+    # Medent's auto-generated "XML Spreadsheet 2003" file into a real,
+    # binary .xlsx -- see save_excel_as_xlsx for the dialog sequence and
+    # its NOT YET CONFIRMED LIVE caveats (format dropdown, compatibility
+    # prompt). Named/timestamped and placed in PDF_OUTPUT_DIR (Downloads),
+    # same folder as the PDF, per explicit user request -- stem format
+    # 'Medent_raw_<MMDDYYYYHHMM>' confirmed against a user-supplied example
+    # (e.g. 'Medent_raw_110420261730'), timestamped at actual save time
+    # (not run-start time) same as pdf_output_path above. A numeric suffix
+    # is appended on collision, same pattern as pdf_output_path.
+    xlsx_stem = f"Medent_raw_{datetime.now():%m%d%Y%H%M}"
+    xlsx_output_path = PDF_OUTPUT_DIR / f"{xlsx_stem}.xlsx"
+    n = 1
+    while xlsx_output_path.exists():
+        n += 1
+        xlsx_output_path = PDF_OUTPUT_DIR / f"{xlsx_stem}_{n}.xlsx"
 
-    # Belt-and-braces: close the Excel window too, in case the workbook
-    # Close() above didn't also end the whole Application (e.g. other
-    # workbooks were already open before this run started).
+    save_excel_as_xlsx(win, xlsx_output_path)
+
+    # Belt-and-braces: close the Excel window in case Save As didn't also
+    # end the whole Application (e.g. other workbooks were already open
+    # before this run started).
     try:
         excel_win = Desktop(backend="uia").window(class_name="XLMAIN")
         if excel_win.exists():
@@ -3332,7 +3316,220 @@ def navigate_to_point_ar_report(app, output_path):
     # reuses the existing logout() helper rather than duplicating its
     # selector.
     logout(app)
-    audit("point_ar_report_complete", xml_path=str(output_path), pdf_path=str(pdf_output_path))
+    audit("point_ar_report_complete", xlsx_path=str(xlsx_output_path), pdf_path=str(pdf_output_path))
+    return xlsx_output_path
+
+
+def save_excel_as_xlsx(win, xlsx_output_path, dialog_timeout=30):
+    """Saves the report data Excel opened into a real, binary .xlsx file via
+    Excel's own File -> Save As, converting it out of Medent's native "XML
+    Spreadsheet 2003" export format.
+
+    NOT YET CONFIRMED LIVE -- this replaces an earlier, confirmed-working
+    approach (reading ActiveWorkbook via COM and shutil.copy-ing Medent's
+    raw XML file untouched; see git history) specifically because the user
+    wants a real Excel Workbook on disk, not a copy of the raw XML. Per
+    user instruction, this is the one path the module docstring's Pass 5
+    section already flagged as the single riskiest, least-tested part of
+    the whole flow -- an earlier live run hit an unexpected format/
+    compatibility prompt doing this exact sequence by hand. Unlike the
+    native "Save Print Output As" dialog elsewhere in this file (owned by a
+    separate splwow64.exe process and therefore invisible to UIA -- see
+    that code's own comment above), this "Save As" dialog is hosted
+    in-process by EXCEL.EXE, so it is expected -- but not yet observed
+    live -- to resolve normally via UIA, the same as any other in-process
+    Windows common Save dialog. Every step below still halts via
+    NavigationCheckpoint with full diagnostics the first time something
+    doesn't match this assumption, same discipline as every other
+    not-yet-confirmed step in this file; expect ElementNotFoundError-style
+    failures on the first live run and correct the selectors below using
+    save_dlg.print_control_identifiers().
+
+    Pass 2 (this revision): F12 was dropped per user report that it may not
+    reliably reach Excel's keyboard focus -- reaching the native dialog is
+    now done by clicking the ribbon directly instead: 'File' tab -> backstage
+    'Save As' (or 'Save a Copy', Office 365's alternate label when a file
+    isn't already in OneDrive -- this run's title bar showed "Saved to this
+    PC", so 'Save As' is expected, but both are tried since neither has been
+    confirmed live) -> 'Browse'. Still UNCONFIRMED: the backstage items'
+    exact control types.
+
+    Pass 3 (this revision): the 'File' tab click is located via OCR, not
+    UIA -- confirmed from a user screenshot that 'File' sits at the top-left
+    corner of the ribbon, left of 'Home'. Office's ribbon is a custom-drawn
+    control (same category of problem as Medent's own owner-drawn menus
+    elsewhere in this file -- see the module docstring's Pass 5 notes), so
+    guessing at a UIA control type for it is no more reliable than guessing
+    at one for Medent's menus was; OCR reads the rendered pixels directly
+    instead of assuming an accessibility tree shape that was never observed.
+    """
+    excel_win = Desktop(backend="uia").window(class_name="XLMAIN")
+    excel_win.set_focus()
+
+    def _locate_file_tab_center():
+        words = _run_ocr(ImageGrab.grab(all_screens=True))
+        candidates = [
+            w for w in words if w["text"].strip(" .,:;\"'").lower() == "file"
+        ]
+        if not candidates:
+            return None
+        # The ribbon's 'File' tab is the topmost/leftmost on-screen match --
+        # distinguishes it from any other occurrence of the word "File"
+        # (e.g. a menu item once a dialog is open later in this function).
+        candidate = min(candidates, key=lambda w: (w["rect"][1], w["rect"][0]))
+        x, y, w_, h_ = candidate["rect"]
+        return (x + w_ // 2, y + h_ // 2)
+
+    def _click_file_tab():
+        point = _locate_file_tab_center()
+        if point is None:
+            raise RuntimeError("'File' ribbon tab not found via OCR")
+        pywinauto_mouse.click(coords=point)
+        return True
+
+    try:
+        wait_until_passes(10, 0.5, _click_file_tab)
+    except Exception as exc:
+        _capture_diagnostics("excel_file_tab_not_found", win)
+        raise NavigationCheckpoint(
+            f"Could not find/click Excel's ribbon 'File' tab via OCR: "
+            f"{exc!r}. Inspect diagnostics under OUTPUT_DIR."
+        )
+    audit("clicked_excel_file_tab")
+
+    save_as_item = None
+    for label in ("Save As", "Save a Copy"):
+        for control_type in ("MenuItem", "ListItem", "Button"):
+            try:
+                candidate = excel_win.child_window(title=label, control_type=control_type)
+                if candidate.exists():
+                    save_as_item = candidate
+                    break
+            except Exception:
+                continue
+        if save_as_item is not None:
+            break
+
+    if save_as_item is None:
+        _capture_diagnostics("excel_file_backstage_save_as_not_found", win)
+        raise NavigationCheckpoint(
+            "Clicked Excel's 'File' tab, but neither 'Save As' nor 'Save a "
+            "Copy' could be found in the backstage menu. Inspect "
+            "diagnostics under OUTPUT_DIR -- the real label/control type "
+            "needs confirming live."
+        )
+    save_as_item.click_input()
+    audit("clicked_excel_backstage_save_as")
+
+    try:
+        excel_win.child_window(title="Browse", control_type="Button").click_input()
+    except Exception as exc:
+        _capture_diagnostics("excel_backstage_browse_not_found", win)
+        raise NavigationCheckpoint(
+            f"Clicked Save As/Save a Copy, but could not find/click a "
+            f"'Browse' button: {exc!r}. Inspect diagnostics under "
+            "OUTPUT_DIR -- the backstage may show an intermediate option "
+            "(e.g. 'This PC') before 'Browse' appears."
+        )
+    audit("clicked_excel_backstage_browse")
+
+    save_dlg = Desktop(backend="uia").window(title_re="Save As")
+
+    def _save_dialog_open():
+        if not save_dlg.exists():
+            raise RuntimeError("Excel 'Save As' dialog not visible yet")
+        return True
+
+    try:
+        wait_until_passes(dialog_timeout, 0.5, _save_dialog_open)
+    except Exception as exc:
+        _capture_diagnostics("excel_save_as_dialog_not_found", win)
+        raise NavigationCheckpoint(
+            "Clicked through File -> Save As -> Browse, but the native "
+            f"'Save As' dialog never appeared within {dialog_timeout}s: "
+            f"{exc!r}. Inspect diagnostics under OUTPUT_DIR."
+        )
+    audit("excel_save_as_dialog_opened")
+
+    try:
+        save_dlg.child_window(
+            control_type="ComboBox", title="Save as type:"
+        ).select("Excel Workbook (*.xlsx)")
+    except Exception as exc:
+        _capture_diagnostics("excel_save_as_type_combo_failed", win)
+        raise NavigationCheckpoint(
+            "Opened Excel's 'Save As' dialog, but could not select 'Excel "
+            f"Workbook (*.xlsx)' in the 'Save as type' dropdown: {exc!r}. "
+            "Inspect diagnostics under OUTPUT_DIR -- the dropdown's real "
+            "control identifiers may differ from what was assumed here; "
+            "use save_dlg.print_control_identifiers() on a live run."
+        )
+    audit("excel_save_as_type_set")
+
+    try:
+        name_field = save_dlg.child_window(control_type="Edit", title="File name:")
+        name_field.set_edit_text(str(xlsx_output_path))
+    except Exception as exc:
+        _capture_diagnostics("excel_save_as_filename_failed", win)
+        raise NavigationCheckpoint(
+            "Set 'Save as type' to Excel Workbook, but could not type the "
+            f"destination path into the filename field: {exc!r}. Inspect "
+            "diagnostics under OUTPUT_DIR."
+        )
+
+    try:
+        save_dlg.child_window(control_type="Button", title="Save").click_input()
+    except Exception as exc:
+        _capture_diagnostics("excel_save_as_save_button_failed", win)
+        raise NavigationCheckpoint(
+            f"Typed the destination path, but could not click 'Save': "
+            f"{exc!r}. Inspect diagnostics under OUTPUT_DIR."
+        )
+    audit("excel_save_as_save_clicked")
+
+    # Excel commonly warns when saving an XML-Spreadsheet-sourced workbook
+    # into real .xlsx format ("Keep Current Format?" or similar) -- exact
+    # button text UNCONFIRMED (never observed live). Best-effort dismissal
+    # only: if this guess is wrong, the file-written check below still
+    # catches it and halts with diagnostics instead of guessing further.
+    def _keep_format_prompt_visible():
+        if not win.child_window(
+            title="Keep Current Format", control_type="Button", visible_only=False
+        ).exists():
+            raise RuntimeError("'Keep Current Format' prompt not visible yet")
+        return True
+
+    try:
+        wait_until_passes(5, 0.3, _keep_format_prompt_visible)
+        win.child_window(
+            title="Keep Current Format", control_type="Button", visible_only=False
+        ).click_input()
+        audit("excel_kept_current_format_prompt_confirmed")
+    except Exception:
+        audit("excel_kept_current_format_prompt_not_shown")
+
+    def _xlsx_written():
+        if not (xlsx_output_path.exists() and xlsx_output_path.stat().st_size > 0):
+            raise RuntimeError(f"{xlsx_output_path} not yet present/non-empty")
+        return True
+
+    try:
+        wait_until_passes(15, 0.5, _xlsx_written)
+    except Exception:
+        _capture_diagnostics("excel_xlsx_not_written", win)
+        raise NavigationCheckpoint(
+            f"Clicked 'Save', but no non-empty .xlsx file appeared at "
+            f"{xlsx_output_path} within 15s. There may be an unhandled "
+            "compatibility prompt still open in Excel -- inspect the app "
+            "directly before closing anything, and check diagnostics under "
+            "OUTPUT_DIR."
+        )
+    audit(
+        "saved_report_xlsx",
+        path=str(xlsx_output_path),
+        size_bytes=xlsx_output_path.stat().st_size,
+    )
+    print(f"Report workbook saved: {xlsx_output_path}")
 
 
 def confirm_report_popup(win, timeout=5, retry=0.3):
@@ -3396,9 +3593,11 @@ def confirm_report_popup(win, timeout=5, retry=0.3):
 
 def verify_exported_report(output_path):
     """Structural-only verification that the export actually produced a
-    usable file: existence, non-zero size, and well-formed XML. Deliberately
-    never reads/logs the file's actual content (it's patient/claims data --
-    PHI), only structural facts (size, element count).
+    usable file: existence, non-zero size, and a well-formed .xlsx (a real
+    xlsx is itself a zip container of XML parts, so a valid zip signature
+    plus the expected top-level part are what "well-formed" means here).
+    Deliberately never reads/logs the file's actual cell data (it's
+    patient/claims data -- PHI), only structural facts (size, part count).
     """
     if not output_path.exists():
         audit("export_verification_failed", path=str(output_path), reason="file_not_found")
@@ -3410,17 +3609,24 @@ def verify_exported_report(output_path):
         raise RuntimeError(f"Exported file at {output_path} is empty (0 bytes).")
 
     try:
-        tree = ET.parse(output_path)
-        element_count = sum(1 for _ in tree.getroot().iter())
-    except ET.ParseError as exc:
+        if not zipfile.is_zipfile(output_path):
+            raise zipfile.BadZipFile("not a zip container")
+        with zipfile.ZipFile(output_path) as zf:
+            part_names = zf.namelist()
+            if "[Content_Types].xml" not in part_names:
+                raise zipfile.BadZipFile(
+                    "missing '[Content_Types].xml' -- not a real .xlsx package"
+                )
+            part_count = len(part_names)
+    except zipfile.BadZipFile as exc:
         audit(
             "export_verification_failed", path=str(output_path),
-            reason="xml_parse_error", error=str(exc),
+            reason="not_a_valid_xlsx", error=str(exc),
         )
-        raise RuntimeError(f"Exported file at {output_path} is not well-formed XML: {exc}")
+        raise RuntimeError(f"Exported file at {output_path} is not a valid .xlsx: {exc}")
 
-    audit("export_verified", path=str(output_path), size_bytes=size, element_count=element_count)
-    print(f"Export verified: {output_path} ({size} bytes, {element_count} XML elements)")
+    audit("export_verified", path=str(output_path), size_bytes=size, part_count=part_count)
+    print(f"Export verified: {output_path} ({size} bytes, {part_count} package parts)")
 
 
 def logout(app):
@@ -3488,10 +3694,9 @@ def main():
 
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     PDF_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    output_path = OUTPUT_DIR / f"Medent_{datetime.now():%Y%m%d_%H%M%S}.xml"
 
     try:
-        navigate_to_point_ar_report(app, output_path)
+        output_path = navigate_to_point_ar_report(app)
     except NavigationCheckpoint as exc:
         print(f"Diagnostic checkpoint reached: {exc}")
         return
