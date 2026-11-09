@@ -113,6 +113,22 @@ Not yet confirmed at all (will raise NotImplementedError where relevant):
   - Selecting a SPECIFIC insurance company (only "ALL" path is stubbed)
   - A report "to"/"from" date other than whatever the hardcoded calendar
     navigation currently clicks (see the CLI-date gap noted above)
+
+Pass 6 (this revision): added select_cloud_practice(), called from main()
+right after launch_medent_if_needed() and before the existing login flow
+(which is otherwise untouched). Per a user screenshot, MEDENT can show a
+"MEDENT Practices" chooser -- separate Cloud/Server tables, New/Edit/Remove/
+Cancel/Connect buttons -- before CCloudLogin when more than one practice is
+configured on the machine; the user confirmed double-clicking a row connects
+that practice the same as selecting it and clicking "Connect". This had never
+come up in either of the two confirmed live runs (no second practice was
+configured for those), so the new function is UNCONFIRMED -- it halts via
+NavigationCheckpoint with full diagnostics if the chooser's row can't be
+found by any of the tried control types, or if it doesn't close after the
+double-click. If the chooser never appears at all (e.g. a session that
+reconnects straight to CCloudLogin), select_cloud_practice() returns False
+after a short timeout and main() continues exactly as it did before this
+pass.
 """
 
 import argparse
@@ -209,6 +225,20 @@ OCR_OPEN_ITEM_REPORTS_TOKENS = ("open", "item", "reports")
 # confirms OCR actually splits this row into exactly these words.
 OCR_CHARGES_FOR_INS_CO_TOKENS = ("open", "item", "charges", "for", "one", "or", "more", "ins", "co")
 
+# Confirmed live on the CAMERON practice variant of this script (2026-11-09):
+# Excel's own native "Save As" dialog is, like the native "Save Print Output
+# As" dialog above, NOT resolvable via UIA at all -- it's absent even from a
+# full Desktop(backend="uia").windows() dump taken at the exact moment it
+# was confirmed on screen via a user screenshot. save_excel_as_xlsx()
+# therefore confirms/drives it via OCR instead of UIA. Per that same
+# screenshot, the dropdown's target entry displays as plain "Excel Workbook"
+# (no "(*.xlsx)" suffix, unlike the stale guess an earlier, UIA-based
+# version of save_excel_as_xlsx used) and is the FIRST row in the list --
+# used here only to VERIFY the click-driven selection landed, not to click
+# it directly (the real click target is located fresh via OCR each time --
+# see save_excel_as_xlsx).
+EXCEL_SAVE_AS_TARGET_TYPE_TOKENS = ("excel", "workbook")
+
 # Inset from the popup's real right-hand content edge (the scrollbar's left
 # edge when present, else the window's own right edge -- see
 # _locate_submenu_arrow_via_ocr) to the '>' arrow's estimated click point.
@@ -227,6 +257,20 @@ MEDENT_CLASS_NAME = "MedentClient"
 # exactly like a user double-clicking it would -- no separate installed .exe
 # path was assumed.
 MEDENT_LAUNCH_SHORTCUT = Path(r"C:\Users\Public\Desktop\MEDENT.lnk")
+
+# The practice chooser ("MEDENT Practices" -- Cloud/Server tables with
+# New/Edit/Remove/Cancel/Connect buttons) that MEDENT can show right after
+# launch, before the CCloudLogin screen, when more than one practice is
+# configured on this machine. Confirmed present/laid out this way from a
+# user screenshot (two Cloud rows: Practice ID hwB3R4kY = "(TLS) COMPASSIONATE
+# WOMEN'S HEALTH", and Practice ID f8Sb6Cg9 = "(TLS) CAMERON PEDIATRICS,
+# PLLC") -- NOT exercised by either of the two live runs the rest of this
+# file's selectors were confirmed against (see module docstring), so
+# select_cloud_practice()'s row lookup is UNCONFIRMED until the next live
+# run proves it live. There is no usable window-title constant for this
+# screen (see select_cloud_practice's docstring for why) -- only the
+# practice id itself identifies it.
+DEFAULT_CLOUD_PRACTICE_ID = "hwB3R4kY"  # (TLS) COMPASSIONATE WOMEN'S HEALTH
 
 # TODO: confirm with user -- should live outside OneDrive sync since output
 # contains PHI (claims/insurance data).
@@ -306,6 +350,85 @@ def launch_medent_if_needed(timeout=60):
     audit("medent_window_appeared")
 
     return app
+
+
+def select_cloud_practice(app, practice_id=DEFAULT_CLOUD_PRACTICE_ID, timeout=10):
+    """If MEDENT's "MEDENT Practices" chooser is showing (per a user
+    screenshot: Cloud/Server tables with columns Practice ID / Name /
+    Destination / Directory / Program, and New/Edit/Remove/Cancel/Connect
+    buttons), double-click the Cloud row whose Practice ID matches
+    `practice_id` -- confirmed by the user to be equivalent to selecting
+    that row and pressing the dialog's own "Connect" button.
+
+    Returns True if the chooser was found and handled, False if it never
+    appeared within `timeout` -- some sessions reconnect straight to
+    CCloudLogin without this screen, and that path must continue exactly as
+    it did before this function existed (same "only add the new case in
+    front of what's already there" discipline as launch_medent_if_needed).
+
+    Detecting the chooser by WINDOW TITLE (an earlier version of this
+    function) doesn't work: a live run showed it always times out and
+    reports "not shown" even when the chooser is plainly on screen, because
+    this app's single top-level window (class MEDENT_CLASS_NAME) has an
+    EMPTY OS-level title at every pre-login screen -- already documented
+    above (see the MEDENT_CLASS_NAME comment) as the same reason
+    LOGIN_WINDOW_TITLE_RE can't match the login screen either. "MEDENT
+    Practices" is a heading drawn INSIDE the window's content, never the
+    actual window_text(). Detection instead looks for real content -- the
+    practice row itself -- which is what this function needs to find anyway,
+    so the presence check and the row lookup are now the same lookup instead
+    of two different (and inconsistently reliable) signals. The
+    chooser-closed check below applies the identical fix: it watches for
+    that same row to stop existing, not for a title that was never there.
+
+    UNCONFIRMED beyond the above: this chooser was never encountered in
+    either of the two live runs the rest of this file's selectors were
+    confirmed against (see module docstring). The row lookup tries the same
+    handful of plausible UIA control types the Excel backstage lookup
+    elsewhere in this file already uses for an unconfirmed native control
+    (DataItem/ListItem/Custom) rather than assuming one; if none match, or
+    the chooser doesn't close after the double-click, this halts via
+    NavigationCheckpoint with full diagnostics instead of guessing further.
+    """
+    win = app.top_window()
+
+    def _find_practice_row():
+        for control_type in ("DataItem", "ListItem", "Custom"):
+            try:
+                candidate = win.child_window(title_re=f".*{practice_id}.*", control_type=control_type)
+                if candidate.exists():
+                    return candidate
+            except Exception:
+                continue
+        raise RuntimeError(f"no row matching Practice ID {practice_id!r} found yet")
+
+    try:
+        row = wait_until_passes(timeout, 0.5, _find_practice_row)
+    except PywinautoTimeoutError:
+        audit("practice_chooser_not_shown")
+        return False
+
+    audit("practice_chooser_detected", practice_id=practice_id)
+
+    row.double_click_input()
+    audit("practice_selected", practice_id=practice_id)
+
+    def _chooser_closed():
+        if row.exists():
+            raise RuntimeError("practice row still present -- chooser still showing")
+        return True
+
+    try:
+        wait_until_passes(10, 0.5, _chooser_closed)
+    except PywinautoTimeoutError as exc:
+        _capture_diagnostics("practice_chooser_did_not_close", win)
+        raise NavigationCheckpoint(
+            f"Double-clicked the Practice ID {practice_id!r} row, but it was "
+            f"still present 10s later -- the chooser may not have closed: "
+            f"{exc!r}. Inspect diagnostics under OUTPUT_DIR."
+        )
+    audit("practice_chooser_closed")
+    return True
 
 
 def is_logged_in(app):
@@ -3161,7 +3284,7 @@ def navigate_to_point_ar_report(app):
     # timestamp instead of reusing output_path's stem. A numeric suffix is
     # appended on collision so the minute-level timestamp can never
     # overwrite an existing PDF.
-    pdf_stem = f"Medent_raw_{datetime.now():%m%d%Y}"
+    pdf_stem = f"Medent_raw_{datetime.now():%m%d%Y%H%M}"
     pdf_output_path = PDF_OUTPUT_DIR / f"{pdf_stem}.pdf"
     n = 1
     while pdf_output_path.exists():
@@ -3233,6 +3356,16 @@ def navigate_to_point_ar_report(app):
             "diagnostics under OUTPUT_DIR."
         )
 
+    # Confirmed live (2026-11-09, this CWH run): the original 15s bound
+    # here was tuned against the two very first confirmed runs, but a
+    # later run timed out here too -- the diagnostic screenshot shows
+    # Medent's own "Printing..." / "Transferring: ...xml" progress overlay
+    # still in progress at 15s (same thing already confirmed on the
+    # Cameron practice variant of this script, which needed the same bump
+    # for the same reason: real report-generation work still running, not
+    # a wrong click/selector). Widened to match.
+    PDF_SAVE_TIMEOUT_S = 300
+
     def _pdf_saved():
         # Same wait_until_passes caveat as _save_dialog_visible above: must
         # raise, not return False, for the retry to actually happen.
@@ -3241,13 +3374,19 @@ def navigate_to_point_ar_report(app):
         return True
 
     try:
-        wait_until_passes(15, 0.5, _pdf_saved)
+        wait_until_passes(PDF_SAVE_TIMEOUT_S, 2.0, _pdf_saved)
     except Exception:
         _capture_diagnostics("pdf_output_missing_or_empty", win)
         raise NavigationCheckpoint(
             "Sent the filename and Enter to the Save dialog (confirmed "
             f"visible via OCR beforehand), but no non-empty PDF appeared at "
-            f"{pdf_output_path} within 15s."
+            f"{pdf_output_path} within {PDF_SAVE_TIMEOUT_S}s. Inspect the "
+            "screenshot under OUTPUT_DIR -- if Medent's own 'Printing...' / "
+            "'Transferring: ...' progress overlay is still visible there, "
+            "report generation itself may just need longer than even this "
+            "bound (increase PDF_SAVE_TIMEOUT_S further); if that overlay "
+            "is gone/absent instead, something else is actually wrong and "
+            "needs fresh diagnosis."
         )
     audit("saved_print_pdf", path=str(pdf_output_path), size_bytes=pdf_output_path.stat().st_size)
     _capture_click_screenshot("print_pdf_saved")
@@ -3283,15 +3422,17 @@ def navigate_to_point_ar_report(app):
 
     # Report data is saved via Excel's own File -> Save As, converting
     # Medent's auto-generated "XML Spreadsheet 2003" file into a real,
-    # binary .xlsx -- see save_excel_as_xlsx for the dialog sequence and
-    # its NOT YET CONFIRMED LIVE caveats (format dropdown, compatibility
-    # prompt). Named/timestamped and placed in PDF_OUTPUT_DIR (Downloads),
-    # same folder as the PDF, per explicit user request -- stem format
-    # 'Medent_raw_<MMDDYYYYHHMM>' confirmed against a user-supplied example
-    # (e.g. 'Medent_raw_110420261730'), timestamped at actual save time
-    # (not run-start time) same as pdf_output_path above. A numeric suffix
-    # is appended on collision, same pattern as pdf_output_path.
-    xlsx_stem = f"Medent_raw_{datetime.now():%m%d%Y%H%M}"
+    # binary .xlsx -- see save_excel_as_xlsx for the dialog sequence.
+    # Named/timestamped and placed in PDF_OUTPUT_DIR (Downloads), same
+    # folder as the PDF, per explicit user request -- stem format
+    # 'medent_cwh_<MM-DD-YYYY>_<hh-mm-AM/PM>' (dashed calendar date,
+    # 12-hour clock; supersedes earlier 'Medent_raw_...'/'Medent_CWH_...'
+    # naming attempts; the PDF above keeps its own separate, already-
+    # established 'Medent_raw_...' stem, untouched), timestamped at actual
+    # save time (not run-start time) same as pdf_output_path above. A
+    # numeric suffix is appended on collision, same pattern as
+    # pdf_output_path.
+    xlsx_stem = f"medent_cwh_{datetime.now():%m-%d-%Y_%I-%M-%p}"
     xlsx_output_path = PDF_OUTPUT_DIR / f"{xlsx_stem}.xlsx"
     n = 1
     while xlsx_output_path.exists():
@@ -3433,57 +3574,159 @@ def save_excel_as_xlsx(win, xlsx_output_path, dialog_timeout=30):
         )
     audit("clicked_excel_backstage_browse")
 
-    save_dlg = Desktop(backend="uia").window(title_re="Save As")
-
-    def _save_dialog_open():
-        if not save_dlg.exists():
-            raise RuntimeError("Excel 'Save As' dialog not visible yet")
+    # Confirmed live on the CAMERON practice variant of this script
+    # (2026-11-09): the UIA-based approach tried here before --
+    # Desktop(backend="uia").window(title_re="Save As") -- NEVER found this
+    # dialog, even after waiting the full dialog_timeout; a diagnostic
+    # dump_top_level_windows() taken at that exact moment (while a user
+    # screenshot confirmed the dialog WAS genuinely on screen) showed it
+    # absent from Desktop(backend="uia").windows() entirely. Same category
+    # of problem as the native "Save Print Output As" dialog earlier in
+    # this file (there, confirmed via a dedicated one-off diagnostic that
+    # it's invisible to BOTH UIA and raw win32gui enumeration) -- so this
+    # is rewritten to never need to resolve a window object at all: confirm
+    # on-screen via full-screen OCR, then drive it via OCR-located mouse
+    # clicks (a follow-up live run also showed this dialog's own documented
+    # keyboard accelerators, e.g. Alt+T/Alt+N, do NOT reach it either --
+    # real clicks sidestep the same focus question by activating whatever
+    # window is physically under the click point).
+    def _save_dialog_visible():
+        words = _run_ocr(ImageGrab.grab(all_screens=True))
+        if (_find_ocr_phrase(words, ("file", "name")) is None
+                or _find_ocr_phrase(words, ("save", "as", "type")) is None):
+            raise RuntimeError("Excel 'Save As' dialog not visible yet (via OCR)")
         return True
 
     try:
-        wait_until_passes(dialog_timeout, 0.5, _save_dialog_open)
+        wait_until_passes(dialog_timeout, 0.5, _save_dialog_visible)
     except Exception as exc:
         _capture_diagnostics("excel_save_as_dialog_not_found", win)
         raise NavigationCheckpoint(
             "Clicked through File -> Save As -> Browse, but the native "
-            f"'Save As' dialog never appeared within {dialog_timeout}s: "
-            f"{exc!r}. Inspect diagnostics under OUTPUT_DIR."
+            f"'Save As' dialog never became visible on screen (via OCR) "
+            f"within {dialog_timeout}s: {exc!r}. Inspect diagnostics under "
+            "OUTPUT_DIR."
         )
     audit("excel_save_as_dialog_opened")
 
+    # Each click target below is relocated via a FRESH OCR pass right
+    # before clicking (not reused from _save_dialog_visible's pass above),
+    # since the dialog could have moved/redrawn between steps.
+    def _locate_label_value_point(label_tokens, x_offset=70):
+        words = _run_ocr(ImageGrab.grab(all_screens=True))
+        match = _find_ocr_phrase(words, label_tokens)
+        if match is None:
+            return None
+        label_right = max(w["rect"][0] + w["rect"][2] for w in match)
+        label_mid_y = sum(w["rect"][1] + w["rect"][3] // 2 for w in match) // len(match)
+        return (label_right + x_offset, label_mid_y)
+
+    # 'Save as type' is set BEFORE the filename (below), not after:
+    # Windows' Save dialog can auto-correct the filename box's extension to
+    # match whatever type is selected, so setting the type first and
+    # typing the full desired path last is what guarantees the final
+    # on-disk name.
+    def _click_save_type_dropdown():
+        point = _locate_label_value_point(("save", "as", "type"))
+        if point is None:
+            raise RuntimeError("'Save as type:' label not found via OCR")
+        pywinauto_mouse.click(coords=point)
+        return True
+
     try:
-        save_dlg.child_window(
-            control_type="ComboBox", title="Save as type:"
-        ).select("Excel Workbook (*.xlsx)")
+        wait_until_passes(10, 0.3, _click_save_type_dropdown)
     except Exception as exc:
-        _capture_diagnostics("excel_save_as_type_combo_failed", win)
+        _capture_diagnostics("excel_save_as_type_dropdown_not_found", win)
         raise NavigationCheckpoint(
-            "Opened Excel's 'Save As' dialog, but could not select 'Excel "
-            f"Workbook (*.xlsx)' in the 'Save as type' dropdown: {exc!r}. "
+            "Opened the Save As dialog, but could not locate/click the "
+            f"'Save as type' dropdown via OCR within 10s: {exc!r}. Inspect "
+            "diagnostics under OUTPUT_DIR."
+        )
+    audit("clicked_excel_save_as_type_dropdown")
+
+    def _click_excel_workbook_option():
+        words = _run_ocr(ImageGrab.grab(all_screens=True))
+        match = _find_ocr_phrase(words, EXCEL_SAVE_AS_TARGET_TYPE_TOKENS)
+        if match is None:
+            raise RuntimeError("'Excel Workbook' row not visible in the opened dropdown")
+        xs = [w["rect"][0] for w in match]
+        ys = [w["rect"][1] for w in match]
+        x2s = [w["rect"][0] + w["rect"][2] for w in match]
+        y2s = [w["rect"][1] + w["rect"][3] for w in match]
+        point = ((min(xs) + max(x2s)) // 2, (min(ys) + max(y2s)) // 2)
+        pywinauto_mouse.click(coords=point)
+        return True
+
+    try:
+        wait_until_passes(5, 0.3, _click_excel_workbook_option)
+    except Exception as exc:
+        _capture_diagnostics("excel_save_as_type_option_not_found", win)
+        raise NavigationCheckpoint(
+            "Opened the 'Save as type' dropdown, but could not locate/"
+            f"click the 'Excel Workbook' row via OCR within 5s: {exc!r}. "
             "Inspect diagnostics under OUTPUT_DIR -- the dropdown's real "
-            "control identifiers may differ from what was assumed here; "
-            "use save_dlg.print_control_identifiers() on a live run."
+            "item order/text may differ from the Cameron run this was "
+            "confirmed against."
         )
     audit("excel_save_as_type_set")
 
-    try:
-        name_field = save_dlg.child_window(control_type="Edit", title="File name:")
-        name_field.set_edit_text(str(xlsx_output_path))
-    except Exception as exc:
-        _capture_diagnostics("excel_save_as_filename_failed", win)
-        raise NavigationCheckpoint(
-            "Set 'Save as type' to Excel Workbook, but could not type the "
-            f"destination path into the filename field: {exc!r}. Inspect "
-            "diagnostics under OUTPUT_DIR."
-        )
+    def _click_filename_field():
+        point = _locate_label_value_point(("file", "name"))
+        if point is None:
+            raise RuntimeError("'File name:' label not found via OCR")
+        pywinauto_mouse.click(coords=point)
+        return True
 
     try:
-        save_dlg.child_window(control_type="Button", title="Save").click_input()
+        wait_until_passes(10, 0.3, _click_filename_field)
+    except Exception as exc:
+        _capture_diagnostics("excel_save_as_filename_field_not_found", win)
+        raise NavigationCheckpoint(
+            "Set 'Save as type' to Excel Workbook, but could not locate/"
+            f"click the 'File name:' field via OCR within 10s: {exc!r}. "
+            "Inspect diagnostics under OUTPUT_DIR."
+        )
+    audit("clicked_excel_save_as_filename_field")
+
+    send_keys("^a", pause=0.05)
+    send_keys(str(xlsx_output_path), with_spaces=True, pause=0.02)
+    audit("excel_save_as_filename_typed")
+
+    # Click the actual 'Save' button rather than a blind Enter -- same
+    # discipline the native 'Save Print Output As' dialog above already
+    # uses (see its own comment on why Enter alone wasn't trusted there),
+    # OCR-located and disambiguated from 'Cancel' on the same row the same
+    # way.
+    def _locate_excel_save_button_center():
+        words = _run_ocr(ImageGrab.grab(all_screens=True))
+        save_words = [w for w in words if w["text"].strip(" .,:;\"'").lower() == "save"]
+        cancel_words = [w for w in words if w["text"].strip(" .,:;\"'").lower() == "cancel"]
+        if not save_words:
+            return None
+        if cancel_words:
+            def dy_to_nearest_cancel(w):
+                return min(abs(w["rect"][1] - c["rect"][1]) for c in cancel_words)
+            candidate = min(save_words, key=dy_to_nearest_cancel)
+        else:
+            candidate = max(save_words, key=lambda w: w["rect"][1])
+        x, y, w_, h_ = candidate["rect"]
+        return (x + w_ // 2, y + h_ // 2)
+
+    def _click_excel_save_button():
+        point = _locate_excel_save_button_center()
+        if point is None:
+            raise RuntimeError("'Save' button text not found via OCR")
+        pywinauto_mouse.click(coords=point)
+        return True
+
+    try:
+        wait_until_passes(10, 0.5, _click_excel_save_button)
     except Exception as exc:
         _capture_diagnostics("excel_save_as_save_button_failed", win)
         raise NavigationCheckpoint(
-            f"Typed the destination path, but could not click 'Save': "
-            f"{exc!r}. Inspect diagnostics under OUTPUT_DIR."
+            f"Typed the destination path, but could not locate/click the "
+            f"'Save' button via OCR within 10s: {exc!r}. Inspect "
+            "diagnostics under OUTPUT_DIR."
         )
     audit("excel_save_as_save_clicked")
 
@@ -3508,21 +3751,25 @@ def save_excel_as_xlsx(win, xlsx_output_path, dialog_timeout=30):
     except Exception:
         audit("excel_kept_current_format_prompt_not_shown")
 
+    # Bumped from an original 15s, per the same headroom confirmed
+    # necessary on the Cameron practice variant for a local Excel Save As.
+    XLSX_SAVE_TIMEOUT_S = 60
+
     def _xlsx_written():
         if not (xlsx_output_path.exists() and xlsx_output_path.stat().st_size > 0):
             raise RuntimeError(f"{xlsx_output_path} not yet present/non-empty")
         return True
 
     try:
-        wait_until_passes(15, 0.5, _xlsx_written)
+        wait_until_passes(XLSX_SAVE_TIMEOUT_S, 1.0, _xlsx_written)
     except Exception:
         _capture_diagnostics("excel_xlsx_not_written", win)
         raise NavigationCheckpoint(
             f"Clicked 'Save', but no non-empty .xlsx file appeared at "
-            f"{xlsx_output_path} within 15s. There may be an unhandled "
-            "compatibility prompt still open in Excel -- inspect the app "
-            "directly before closing anything, and check diagnostics under "
-            "OUTPUT_DIR."
+            f"{xlsx_output_path} within {XLSX_SAVE_TIMEOUT_S}s. There may "
+            "be an unhandled compatibility prompt still open in Excel -- "
+            "inspect the app directly before closing anything, and check "
+            "diagnostics under OUTPUT_DIR."
         )
     audit(
         "saved_report_xlsx",
@@ -3686,6 +3933,13 @@ def main():
     user_id, password = get_credentials()
 
     app = launch_medent_if_needed()
+
+    try:
+        select_cloud_practice(app)
+    except NavigationCheckpoint as exc:
+        print(f"Diagnostic checkpoint reached: {exc}")
+        return
+
     if is_logged_in(app):
         audit("already_logged_in")
     else:
